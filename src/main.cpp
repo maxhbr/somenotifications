@@ -52,11 +52,8 @@ static Monitor* monitorFromSurface(const wl_surface* surface);
 static void setupMonitor(uint32_t name, wl_output* output);
 static void updatemon(Monitor &mon);
 static void onReady();
-static void setupStatusFifo();
-static void onStatus();
 static void onStdin();
 static void handleStdin(const std::string& line);
-static void updateVisibility(const std::string& name, bool(*updater)(bool));
 static void onGlobalAdd(void*, wl_registry* registry, uint32_t name, const char* interface, uint32_t version);
 static void onGlobalRemove(void*, wl_registry* registry, uint32_t name);
 static void requireGlobal(const void* p, const char* name);
@@ -77,12 +74,9 @@ static std::vector<std::pair<uint32_t, wl_output*>> uninitializedOutputs;
 static std::list<Seat> seats;
 static Monitor* selmon;
 static std::string lastStatus;
-static std::string statusFifoName;
 static std::vector<pollfd> pollfds;
 static std::array<int, 2> signalSelfPipe;
 static int displayFd {-1};
-static int statusFifoFd {-1};
-static int statusFifoWriter {-1};
 static bool quitting {false};
 
 void spawn(Monitor&, const Arg& arg)
@@ -219,7 +213,6 @@ void onReady()
 	requireGlobal(shm, "wl_shm");
 	requireGlobal(wlrLayerShell, "zwlr_layer_shell_v1");
 	requireGlobal(xdgOutputManager, "zxdg_output_manager_v1");
-	setupStatusFifo();
 	wl_display_roundtrip(display); // roundtrip so we receive all dwl tags etc.
 
 	ready = true;
@@ -227,50 +220,6 @@ void onReady()
 		setupMonitor(output.first, output.second);
 	}
 	wl_display_roundtrip(display); // wait for xdg_output names before we read stdin
-}
-
-bool createFifo(std::string path)
-{
-	auto result = mkfifo(path.c_str(), 0666);
-	if (result == 0) {
-		auto fd = open(path.c_str(), O_CLOEXEC | O_NONBLOCK | O_RDONLY);
-		if (fd < 0) {
-			diesys("open status fifo reader");
-		}
-		statusFifoName = path;
-		statusFifoFd = fd;
-
-		fd = open(path.c_str(), O_CLOEXEC | O_WRONLY);
-		if (fd < 0) {
-			diesys("open status fifo writer");
-		}
-		statusFifoWriter = fd;
-
-		pollfds.push_back({
-			.fd = statusFifoFd,
-			.events = POLLIN,
-		});
-		return true;
-	} else if (errno != EEXIST) {
-		diesys("mkfifo");
-	}
-
-	return false;
-}
-
-void setupStatusFifo()
-{
-	if (!statusFifoName.empty()) {
-		createFifo(statusFifoName);
-		return;
-	}
-
-	for (auto i=0; i<100; i++) {
-		auto path = std::string{getenv("XDG_RUNTIME_DIR")} + "/somebar-" + std::to_string(i);
-		if (createFifo(path)) {
-			return;
-		}
-	}
 }
 
 static LineBuffer<512> stdinBuffer;
@@ -335,55 +284,6 @@ static void handleStdin(const std::string& line)
 	updatemon(*mon);
 }
 
-const std::string prefixStatus = "status ";
-const std::string prefixShow = "show ";
-const std::string prefixHide = "hide ";
-const std::string prefixToggle = "toggle ";
-const std::string argAll = "all";
-const std::string argSelected = "selected";
-
-static LineBuffer<512> statusBuffer;
-void onStatus()
-{
-	statusBuffer.readLines(
-	[](void* p, size_t size) {
-		return read(statusFifoFd, p, size);
-	},
-	[](const char* buffer, size_t n) {
-		auto str = std::string {buffer, n};
-		if (str.rfind(prefixStatus, 0) == 0) {
-			lastStatus = str.substr(prefixStatus.size());
-			for (auto &monitor : monitors) {
-				monitor.bar.setStatus(lastStatus);
-				monitor.bar.invalidate();
-			}
-		} else if (str.rfind(prefixShow, 0) == 0) {
-			updateVisibility(str.substr(prefixShow.size()), [](bool) { return true; });
-		} else if (str.rfind(prefixHide, 0) == 0) {
-			updateVisibility(str.substr(prefixHide.size()), [](bool) { return false; });
-		} else if (str.rfind(prefixToggle, 0) == 0) {
-			updateVisibility(str.substr(prefixToggle.size()), [](bool vis) { return !vis; });
-		}
-	});
-}
-
-void updateVisibility(const std::string& name, bool(*updater)(bool))
-{
-	auto isCurrent = name == argSelected;
-	auto isAll = name == argAll;
-	for (auto& mon : monitors) {
-		if (isAll ||
-			isCurrent && &mon == selmon ||
-			mon.xdgName == name) {
-			auto newVisibility = updater(mon.desiredVisibility);
-			if (newVisibility != mon.desiredVisibility) {
-				mon.desiredVisibility = newVisibility;
-				updatemon(mon);
-			}
-		}
-	}
-}
-
 struct HandleGlobalHelper {
 	wl_registry* registry;
 	uint32_t name;
@@ -438,41 +338,15 @@ int main(int argc, char* argv[])
 	int opt;
 	while ((opt = getopt(argc, argv, "chvs:")) != -1) {
 		switch (opt) {
-			case 's':
-				statusFifoName = optarg;
-				break;
 			case 'h':
-				printf("Usage: %s [-h] [-v] [-s path to the fifo] [-c command]\n", argv[0]);
+				printf("Usage: %s [-h] [-v]\n", argv[0]);
 				printf("  -h: Show this help\n");
 				printf("  -v: Show somebar version\n");
-				printf("  -s: Change path to the fifo (default is \"$XDG_RUNTIME_DIR/somebar-0\")\n");
-				printf("  -c: Sends a command to sombar. See README for details.\n");
 				printf("If any of these are specified (except -s), somebar exits after the action.\n");
 				printf("Otherwise, somebar will display itself.\n");
 				exit(0);
 			case 'v':
 				printf("somebar " SOMEBAR_VERSION "\n");
-				exit(0);
-			case 'c':
-				if (optind >= argc) {
-					die("Expected command");
-				}
-				if (statusFifoName.empty()) {
-					statusFifoName = std::string {getenv("XDG_RUNTIME_DIR")} + "/somebar-0";
-				}
-				statusFifoWriter = open(statusFifoName.c_str(), O_WRONLY | O_CLOEXEC);
-				if (statusFifoWriter < 0) {
-					fprintf(stderr, "could not open %s: ", statusFifoName.c_str());
-					perror("");
-					exit(1);
-				}
-				auto str = std::string {};
-				for (auto i = optind; i<argc; i++) {
-					if (i > optind) str += " ";
-					str += argv[i];
-				}
-				str += "\n";
-				write(statusFifoWriter, str.c_str(), str.size());
 				exit(0);
 		}
 	}
@@ -552,8 +426,6 @@ int main(int argc, char* argv[])
 					}
 				} else if (ev.fd == STDIN_FILENO && (ev.revents & POLLIN)) {
 					onStdin();
-				} else if (ev.fd == statusFifoFd && (ev.revents & POLLIN)) {
-					onStatus();
 				} else if (ev.fd == signalSelfPipe[0] && (ev.revents & POLLIN)) {
 					quitting = true;
 				}
@@ -591,12 +463,6 @@ void setCloexec(int fd)
 	}
 	if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
 		diesys("fcntl FD_SETFD");
-	}
-}
-
-void cleanup() {
-	if (!statusFifoName.empty()) {
-		unlink(statusFifoName.c_str());
 	}
 }
 
